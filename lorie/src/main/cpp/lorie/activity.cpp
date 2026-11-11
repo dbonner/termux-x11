@@ -1,75 +1,50 @@
-#include <cstdio>
-#include <cstdlib>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdbool.h>
 #include <unistd.h>
-#include <cstring>
+#include <string.h>
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/mman.h>
-#include <cerrno>
+#include <errno.h>
 #include <jni.h>
 #include <android/looper.h>
-#include <cwchar>
+#include <wchar.h>
 #include <linux/in.h>
 #include <arpa/inet.h>
 #include <poll.h>
-#include <new>
 #include "lorie.h"
 
 #pragma clang diagnostic ignored "-Wunknown-pragmas"
 #pragma ide diagnostic ignored "cppcoreguidelines-narrowing-conversions"
 #pragma ide diagnostic ignored "ConstantFunctionResult"
 #define log(prio, ...) __android_log_print(ANDROID_LOG_ ## prio, "LorieNative", __VA_ARGS__)
-// `r` must be a LorieViewResources* — the connection fd is per-instance state, not a process global.
-#define sendEvent(r, ...) do { if ((r) && (r)->connFd != -1) { lorieEvent e = { __VA_ARGS__ }; write((r)->connFd, &e, sizeof(e)); } } while (0)
+#define sendEvent(...) do { if (conn_fd != -1) { lorieEvent e = { __VA_ARGS__ }; write(conn_fd, &e, sizeof(e)); } } while (0)
 
-// Timestamp of the last real input reaching the X session, from any source. Read/written only
-// from the Android main thread via JNI.
-static volatile int64_t lastInputTimestampMs = 0;
-
-static int64_t nowMs() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t) ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
+extern volatile int conn_fd; // The only variable from shared with X server code.
+bool lorieDebugEnabled = false;
 
 static struct {
     jclass self;
-    jmethodID clientConnectedStateChanged, resetIme;
-    jfieldID lastServerHeartbeat;
-} MainActivity = {nullptr};
+    jmethodID getInstance, clientConnectedStateChanged, resetIme;
+} MainActivity = {0};
 
 static struct {
     jclass self;
     jmethodID forName;
     jmethodID decode;
-} Charset = {nullptr};
+} Charset = {0};
 
 static struct {
     jclass self;
     jmethodID toString;
-} CharBuffer = {nullptr};
+} CharBuffer = {0};
 
-static struct {
-    jmethodID setLaunchWindowingMode;
-} ActivityOptions = {nullptr};
-
-// Bundles the native state belonging to the current LorieView instance so it can be released
-// as a unit when that instance is torn down, instead of leaking as scattered process globals.
-struct LorieViewResources {
-    Renderer renderer;
-    JNIEnv* env = nullptr;    // GUI-thread JNIEnv. Must be used only in GUI thread.
-    jobject thiz = nullptr;   // global ref to the owning LorieView
-    jobject activity = nullptr; // global ref to the owning MainActivity
-    volatile int connFd = -1;
-    bool destroyed = true;
-
-    LorieViewResources(JNIEnv* callerEnv, jobject view);
-    ~LorieViewResources();
-    void connect(jint fd);
-    int xcallback(int fd, int events);
-};
+static JNIEnv *guienv = NULL; // Must be used only in GUI thread.
+static jobject globalThiz = NULL;
+static Renderer g_renderer;
 
 static jclass FindClassOrDie(JNIEnv *env, const char* name) {
     jclass clazz = env->FindClass(name);
@@ -78,7 +53,7 @@ static jclass FindClassOrDie(JNIEnv *env, const char* name) {
         sprintf(buffer, "class %s not found", name);
         log(ERROR, "%s", buffer);
         env->FatalError(buffer);
-        return nullptr;
+        return NULL;
     }
 
     return (jclass) env->NewGlobalRef(clazz);
@@ -91,14 +66,13 @@ static jmethodID FindMethodOrDie(JNIEnv *env, jclass clazz, const char* name, co
         sprintf(buffer, "method %s %s not found", name, signature);
         log(ERROR, "%s", buffer);
         env->FatalError(buffer);
-        return nullptr;
+        return NULL;
     }
 
     return method;
 }
 
-// @CriticalNative: no implicit JNIEnv*/jclass, unlike the @FastNative entries below.
-static jboolean requestConnection(__unused jlong ptr) {
+static jboolean requestConnection(__unused JNIEnv *env, __unused jclass clazz) {
 #define check(cond, fmt, ...) if ((cond)) do { __android_log_print(ANDROID_LOG_ERROR, "requestConnection", fmt, ## __VA_ARGS__); goto end; } while (0)
     bool sent = JNI_FALSE;
     // We do not want to block GUI thread for a long time so we will set timeout to 20 msec.
@@ -134,7 +108,9 @@ static jboolean requestConnection(__unused jlong ptr) {
 #undef errorReturn
 }
 
-static jlong nativeInit(JNIEnv *env, jobject thiz) {
+static void connect_(__unused JNIEnv* env, __unused jobject cls, jint fd);
+static void nativeInit(JNIEnv *env, jobject thiz) {
+    JavaVM* vm;
     if (!Charset.self) {
         // Init clipboard-related JNI stuff
         Charset.self = FindClassOrDie(env, "java/nio/charset/Charset");
@@ -145,85 +121,49 @@ static jlong nativeInit(JNIEnv *env, jobject thiz) {
         CharBuffer.toString = FindMethodOrDie(env, CharBuffer.self, "toString", "()Ljava/lang/String;", JNI_FALSE);
 
         MainActivity.self = FindClassOrDie(env,  "com/termux/x11/MainActivity");
+        MainActivity.getInstance = FindMethodOrDie(env, MainActivity.self, "getInstance", "()Lcom/termux/x11/MainActivity;", JNI_TRUE);
         MainActivity.clientConnectedStateChanged = FindMethodOrDie(env, MainActivity.self, "clientConnectedStateChanged", "()V", JNI_FALSE);
-        MainActivity.lastServerHeartbeat = env->GetFieldID(MainActivity.self, "lastServerHeartbeat", "J");
         MainActivity.resetIme = FindMethodOrDie(env, env->GetObjectClass(thiz), "resetIme", "()V", JNI_FALSE);
     }
 
-    return (jlong) (intptr_t) new (malloc(sizeof(LorieViewResources))) LorieViewResources(env, thiz);
+    g_renderer.init(env);
+
+    env->GetJavaVM(&vm);
+    vm->AttachCurrentThread(&guienv, NULL);
+    globalThiz = guienv->NewGlobalRef(thiz);
+    connect_(NULL, NULL, -1);
 }
 
-LorieViewResources::LorieViewResources(JNIEnv *callerEnv, jobject view) {
-    JavaVM* vm;
-    destroyed = false;
-    renderer.init(callerEnv, view);
-    renderer.connFdPtr = &connFd;
+static int xcallback(int fd, int events, __unused void* data) {
+    JNIEnv *env = guienv;
+    jobject thiz = globalThiz;
 
-    callerEnv->GetJavaVM(&vm);
-    vm->AttachCurrentThread(&env, nullptr);
-    thiz = env->NewGlobalRef(view);
-
-    jfieldID activityField = env->GetFieldID(env->GetObjectClass(view), "activity", "Lcom/termux/x11/MainActivity;");
-    jobject a = env->GetObjectField(view, activityField);
-    if (a)
-        activity = env->NewGlobalRef(a);
-
-    connect(-1);
-}
-
-LorieViewResources::~LorieViewResources() {
-    destroyed = true;
-
-    if (connFd != -1) {
-        ALooper_removeFd(ALooper_forThread(), connFd);
-        close(connFd);
-        connFd = -1;
-    }
-
-    renderer.destroy();
-
-    if (thiz) {
-        env->DeleteGlobalRef(thiz);
-        thiz = nullptr;
-    }
-
-    if (activity) {
-        env->DeleteGlobalRef(activity);
-        activity = nullptr;
-    }
-}
-
-int LorieViewResources::xcallback(int fd, int events) {
     if (events & (ALOOPER_EVENT_ERROR | ALOOPER_EVENT_HANGUP)) {
+        jobject instance = env->CallStaticObjectMethod(MainActivity.self, MainActivity.getInstance);
+        if (instance)
+            env->CallVoidMethod(instance, MainActivity.clientConnectedStateChanged);
+
         ALooper_removeFd(ALooper_forThread(), fd);
-        close(connFd);
-        connFd = -1;
-        renderer.setSharedState(nullptr);
-        renderer.removeAllBuffers();
+        close(conn_fd);
+        conn_fd = -1;
+        g_renderer.setSharedState(NULL);
+        g_renderer.removeAllBuffers();
         log(DEBUG, "disconnected");
-        if (activity)
-            env->CallVoidMethod(activity, MainActivity.clientConnectedStateChanged);
         return 1;
     }
 
-    if (connFd != -1) {
+    if (conn_fd != -1) {
         lorieEvent e = {0};
 
         again:
-        if (read(connFd, &e, sizeof(e)) == sizeof(e)) {
+        if (read(conn_fd, &e, sizeof(e)) == sizeof(e)) {
             switch(e.type) {
                 case EVENT_CLIPBOARD_SEND: {
                     if (!e.clipboardSend.count)
                         break;
-                    size_t capacity;
-                    if (__builtin_add_overflow((size_t) e.clipboardSend.count, (size_t) 1, &capacity))
-                        return xcallback(fd, ALOOPER_EVENT_HANGUP);
-                    char *clipboard = (char*) calloc(capacity, 1);
-                    if (!clipboard) {
-                        log(ERROR, "Could not allocate clipboard buffer");
-                        return xcallback(fd, ALOOPER_EVENT_HANGUP);
-                    }
-                    read(connFd, clipboard, e.clipboardSend.count);
+                    char clipboard[e.clipboardSend.count + 1];
+                    memset(clipboard, 0, e.clipboardSend.count + 1);
+                    read(conn_fd, clipboard, sizeof(clipboard));
                     clipboard[e.clipboardSend.count] = 0;
                     log(DEBUG, "Clipboard content (%zu symbols) is %s", strlen(clipboard), clipboard);
                     jmethodID id = env->GetMethodID(env->GetObjectClass(thiz), "setClipboardText","(Ljava/lang/String;)V");
@@ -232,9 +172,8 @@ int LorieViewResources::xcallback(int fd, int events) {
                     jobject cb = env->CallObjectMethod(charset, Charset.decode, bb);
                     env->DeleteLocalRef(bb);
 
-                    auto str = (jstring) env->CallObjectMethod(cb, CharBuffer.toString);
+                    jstring str = (jstring) env->CallObjectMethod(cb, CharBuffer.toString);
                     env->CallVoidMethod(thiz, id, str);
-                    free(clipboard);
                     break;
                 }
                 case EVENT_CLIPBOARD_REQUEST: {
@@ -242,85 +181,74 @@ int LorieViewResources::xcallback(int fd, int events) {
                     break;
                 }
                 case EVENT_SHARED_SERVER_STATE: {
-                    struct lorie_shared_server_state* state = nullptr;
-                    int stateFd = ancil_recv_fd(connFd);
+                    struct lorie_shared_server_state* state = NULL;
+                    int stateFd = ancil_recv_fd(conn_fd);
 
                     if (stateFd < 0)
                         break;
 
-                    state = (struct lorie_shared_server_state*) mmap(nullptr, sizeof(*state), PROT_READ|PROT_WRITE, MAP_SHARED, stateFd, 0);
+                    state = (struct lorie_shared_server_state*) mmap(NULL, sizeof(*state), PROT_READ|PROT_WRITE, MAP_SHARED, stateFd, 0);
                     if (!state || state == MAP_FAILED) {
                         log(ERROR, "Failed to map server state: %s", strerror(errno));
-                        state = nullptr;
+                        state = NULL;
                     }
 
-                    renderer.setSharedState(state);
+                    g_renderer.setSharedState(state);
 
                     close(stateFd); // Closing file descriptor does not unmmap shared memory fragment.
                     break;
                 }
                 case EVENT_ADD_BUFFER: {
-                    static LorieBuffer* buffer = nullptr;
+                    static LorieBuffer* buffer = NULL;
                     const LorieBuffer_Desc* desc;
-                    LorieBuffer_recvHandleFromUnixSocket(connFd, &buffer);
+                    LorieBuffer_recvHandleFromUnixSocket(conn_fd, &buffer);
                     desc = LorieBuffer_description(buffer);
                     log(INFO, "Received shared buffer width %d stride %d height %d format %d type %d id %llu", desc->width, desc->stride, desc->height, desc->format, desc->type, desc->id);
-                    renderer.addBuffer(buffer);
+                    g_renderer.addBuffer(buffer);
                     break;
                 }
                 case EVENT_REMOVE_BUFFER: {
-                    renderer.removeBuffer(e.removeBuffer.id);
+                    g_renderer.removeBuffer(e.removeBuffer.id);
                     break;
                 }
                 case EVENT_WINDOW_FOCUS_CHANGED: {
                     env->CallVoidMethod(thiz, MainActivity.resetIme);
-                    break;
-                }
-                case EVENT_HEARTBEAT: {
-                    if (activity)
-                        env->SetLongField(activity, MainActivity.lastServerHeartbeat, nowMs());
-                    break;
-                }
-                case EVENT_SYNC_REPLY: {
-                    jmethodID id = env->GetMethodID(env->GetObjectClass(thiz), "onSyncReply", "(I)V");
-                    env->CallVoidMethod(thiz, id, (jint) e.sync.serial);
-                    break;
                 }
             }
         }
 
         int n;
-        if (ioctl(connFd, FIONREAD, &n) >= 0 && n > sizeof(e))
+        if (ioctl(conn_fd, FIONREAD, &n) >= 0 && n > sizeof(e))
             goto again;
     }
 
     return 1;
 }
 
-void LorieViewResources::connect(jint fd) {
-    if (connFd != -1) {
-        ALooper_removeFd(ALooper_forThread(), connFd);
-        close(connFd);
-        renderer.setSharedState(nullptr);
-        renderer.removeAllBuffers();
+static void connect_(__unused JNIEnv* env, __unused jobject cls, jint fd) {
+    if (conn_fd != -1) {
+        ALooper_removeFd(ALooper_forThread(), conn_fd);
+        close(conn_fd);
+        g_renderer.setSharedState(NULL);
+        g_renderer.removeAllBuffers();
         log(DEBUG, "disconnected");
     }
 
-    if ((connFd = fd) != -1) {
-        ALooper_addFd(ALooper_forThread(), fd, 0, ALOOPER_EVENT_INPUT | ALOOPER_EVENT_ERROR | ALOOPER_EVENT_HANGUP,
-                      +[](int fd, int events, void* data) -> int { return ((LorieViewResources*) data)->xcallback(fd, events); }, this);
+    if ((conn_fd = fd) != -1) {
+        ALooper_addFd(ALooper_forThread(), fd, 0, ALOOPER_EVENT_INPUT | ALOOPER_EVENT_ERROR | ALOOPER_EVENT_HANGUP, xcallback, NULL);
 
         // Give the X server our renderer wakeup cond var fd, resent on every reconnect.
         lorieEvent e = { .type = EVENT_RENDERER_WAKEUP_COND };
-        write(connFd, &e, sizeof(e));
-        ancil_send_fd(connFd, renderer.getWakeupCondFd());
+        write(conn_fd, &e, sizeof(e));
+        ancil_send_fd(conn_fd, g_renderer.getWakeupCondFd());
 
         log(DEBUG, "XCB connection is successfull");
     }
 }
 
-static void startLogcat(JNIEnv *env, __unused jclass clazz, __unused jlong ptr, jint fd) {
+static void startLogcat(JNIEnv *env, __unused jobject cls, jint fd) {
     log(DEBUG, "Starting logcat with output to given fd");
+    lorieDebugEnabled = true;
 
     switch(fork()) {
         case -1:
@@ -338,12 +266,10 @@ static void startLogcat(JNIEnv *env, __unused jclass clazz, __unused jlong ptr, 
     }
 }
 
-static void sendTextEvent(JNIEnv *env, __unused jobject thiz, jlong ptr, jbyteArray text) {
-    lastInputTimestampMs = nowMs();
-    auto* r = (LorieViewResources*) ptr;
-    if (r && r->connFd != -1 && text) {
+static void sendTextEvent(JNIEnv *env, __unused jobject thiz, jbyteArray text) {
+    if (conn_fd != -1 && text) {
         jsize length = env->GetArrayLength(text);
-        jbyte *str = env->GetByteArrayElements(text, nullptr);
+        jbyte *str = env->GetByteArrayElements(text, NULL);
         char *p = (char*) str;
         mbstate_t mbstate = { 0 };
         if (!length)
@@ -363,13 +289,9 @@ static void sendTextEvent(JNIEnv *env, __unused jobject thiz, jlong ptr, jbyteAr
             if (len == 0)
                 break;
 
-            if (wc == L'\n') {
-                sendEvent(r, .key = { .t = EVENT_KEY, .key = KEY_ENTER + 8, .state = 1 });
-                sendEvent(r, .key = { .t = EVENT_KEY, .key = KEY_ENTER + 8, .state = 0 });
-            } else if (wc != L'\r') {
-                log(DEBUG, "Sending unicode event: %lc (U+%X)", wc, wc);
-                sendEvent(r, .unicode = { .t = EVENT_UNICODE, .code = (uint32_t) wc });
-            }
+            log(DEBUG, "Sending unicode event: %lc (U+%X)", wc, wc);
+            lorieEvent e = { .unicode = { .t = EVENT_UNICODE, .code = (uint32_t) wc } };
+            write(conn_fd, &e, sizeof(e));
             p += len;
             if (p - (char*) str >= length)
                 break;
@@ -380,229 +302,112 @@ static void sendTextEvent(JNIEnv *env, __unused jobject thiz, jlong ptr, jbyteAr
     }
 }
 
-extern char* __progname;
-
 JNIEXPORT jint JNI_OnLoad(JavaVM *vm, __unused void *reserved) {
     JNIEnv* env;
-
-    if (!strcmp(__progname, "com.termux.x11")) {
-        // Redirects stderr to logcat.
-        pthread_create([]{ static pthread_t t; return &t; }(), nullptr, +[](__unused void* cookie) -> void* {
-            FILE *fp;
-            int p[2];
-            size_t len;
-            char *line = nullptr;
-            pipe(p);
-
-            fp = fdopen(p[0], "r");
-
-            dup2(p[1], 2);
-            dup2(p[1], 1);
-            while ((getline(&line, &len, fp)) != -1) {
-                log(DEBUG, "%s%s", line, (line[len - 1] == '\n') ? "" : "\n");
-            }
-
-            return nullptr;
-        }, nullptr);
-    }
-
-    static constexpr JNINativeMethod methods[] = {
-            {"nativeInit", "()J", (void *)&nativeInit},
-            {"nativeDestroy", "(J)V", (void *) +[](__unused JNIEnv *env, __unused jobject thiz, jlong ptr) {
-                auto* r = (LorieViewResources*) ptr;
-                if (!r) return;
-                r->~LorieViewResources();
-                free(r);
+    static JNINativeMethod methods[] = {
+            {"nativeInit", "()V", (void *)&nativeInit},
+            {"surfaceChanged", "(Landroid/view/Surface;)V", (void *) +[](JNIEnv *env, __unused jobject thiz, jobject sfc) {
+                g_renderer.setWindow(env, sfc);
             }},
-            {"surfaceChanged", "(JLandroid/view/Surface;)V", (void *) +[](JNIEnv *env, __unused jobject thiz, jlong ptr, jobject sfc) {
-                auto* r = (LorieViewResources*) ptr;
-                if (!r || r->destroyed) return;
-                r->renderer.setWindow(env, sfc);
+            {"setViewport", "(IIIIIII)V", (void *) +[](__unused JNIEnv *env, __unused jclass clazz, jint x, jint y, jint w, jint h, jint ew, jint eh, jint hidden) {
+                g_renderer.setViewport(x, y, w, h, ew, eh, hidden);
             }},
-            {"setViewport", "(JIIIIIII)V", (void *) +[](__unused JNIEnv *env, __unused jobject thiz, jlong ptr, jint x, jint y, jint w, jint h, jint ew, jint eh, jint hidden) {
-                auto* r = (LorieViewResources*) ptr;
-                if (!r || r->destroyed) return;
-                r->renderer.setViewport(x, y, w, h, ew, eh, hidden);
+            {"setRendererZoom", "(I)V", (void *) +[](__unused JNIEnv *env, __unused jclass clazz, jint percent) {
+                g_renderer.setZoom(percent);
             }},
-            {"setRendererZoom", "(JI)V", (void *) +[](__unused JNIEnv *env, __unused jobject thiz, jlong ptr, jint percent) {
-                auto* r = (LorieViewResources*) ptr;
-                if (!r || r->destroyed) return;
-                r->renderer.setZoom(percent);
+            {"setFiltering", "(I)V", (void *) +[](__unused JNIEnv* env, __unused jobject self, jint filtering) {
+                g_renderer.setFiltering(filtering);
             }},
-            {"setZoomAnchor", "(JFFFF)V", (void *) +[](__unused JNIEnv *env, __unused jobject thiz, jlong ptr, jfloat sourceX, jfloat sourceY, jfloat fracX, jfloat fracY) {
-                auto* r = (LorieViewResources*) ptr;
-                if (!r || r->destroyed) return;
-                r->renderer.setZoomAnchor(sourceX, sourceY, fracX, fracY);
+            {"connect", "(I)V", (void *)&connect_},
+            {"connected", "()Z", (void *) +[](__unused JNIEnv* env, __unused jclass clazz) -> jboolean {
+                return conn_fd != -1;
             }},
-            {"clearZoomAnchor", "(J)V", (void *) +[](__unused JNIEnv *env, __unused jobject thiz, jlong ptr) {
-                auto* r = (LorieViewResources*) ptr;
-                if (!r || r->destroyed) return;
-                r->renderer.clearZoomAnchor();
+            {"startLogcat", "(I)V", (void *)&startLogcat},
+            {"setClipboardSyncEnabled", "(ZZ)V", (void *) +[](__unused JNIEnv* env, __unused jobject cls, jboolean enable, __unused jboolean ignored) {
+                sendEvent(.clipboardEnable = { .t = EVENT_CLIPBOARD_ENABLE, .enable = enable });
             }},
-            {"setFollowCursorPan", "(JZ)V", (void *) +[](__unused JNIEnv *env, __unused jobject thiz, jlong ptr, jboolean enabled) {
-                auto* r = (LorieViewResources*) ptr;
-                if (!r || r->destroyed) return;
-                r->renderer.setFollowCursorPan(enabled);
+            {"sendClipboardAnnounce", "()V", (void *) +[](__unused JNIEnv *env, __unused jobject thiz) {
+                sendEvent(.type = EVENT_CLIPBOARD_ANNOUNCE);
             }},
-            {"getCursorPosition", "(J)J", (void *) +[](__unused JNIEnv *env, __unused jobject thiz, jlong ptr) -> jlong {
-                auto* r = (LorieViewResources*) ptr;
-                if (!r || r->destroyed || !r->renderer.state) return 0;
-                return ((jlong) r->renderer.state->cursor.x << 32) | (jlong) r->renderer.state->cursor.y;
-            }},
-            {"sendSync", "(JI)V", (void *) +[](__unused JNIEnv *env, __unused jobject thiz, jlong ptr, jint serial) {
-                auto* r = (LorieViewResources*) ptr;
-                sendEvent(r, .sync = { .t = EVENT_SYNC, .serial = (uint32_t) serial });
-            }},
-            {"setFiltering", "(JI)V", (void *) +[](__unused JNIEnv* env, __unused jobject self, jlong ptr, jint filtering) {
-                auto* r = (LorieViewResources*) ptr;
-                if (!r || r->destroyed) return;
-                r->renderer.setFiltering(filtering);
-            }},
-            {"connect", "(JI)V", (void *) +[](__unused JNIEnv* env, __unused jclass clazz, jlong ptr, jint fd) {
-                auto* r = (LorieViewResources*) ptr;
-                if (!r) return;
-                r->connect(fd);
-            }},
-            // @CriticalNative: no implicit JNIEnv*/jclass, unlike the @FastNative entries below.
-            {"connected", "(J)Z", (void *) +[](jlong ptr) -> jboolean {
-                auto* r = (LorieViewResources*) ptr;
-                return r && r->connFd != -1;
-            }},
-            {"startLogcat", "(JI)V", (void *)&startLogcat},
-            {"setClipboardSyncEnabled", "(JZZ)V", (void *) +[](__unused JNIEnv* env, __unused jobject cls, jlong ptr, jboolean enable, __unused jboolean ignored) {
-                auto* r = (LorieViewResources*) ptr;
-                sendEvent(r, .clipboardEnable = { .t = EVENT_CLIPBOARD_ENABLE, .enable = enable });
-            }},
-            {"sendClipboardAnnounce", "(J)V", (void *) +[](__unused JNIEnv *env, __unused jobject thiz, jlong ptr) {
-                auto* r = (LorieViewResources*) ptr;
-                sendEvent(r, .type = EVENT_CLIPBOARD_ANNOUNCE);
-            }},
-            {"sendClipboardEvent", "(J[B)V", (void *) +[](JNIEnv *env, __unused jobject thiz, jlong ptr, jbyteArray text) {
-                auto* r = (LorieViewResources*) ptr;
-                if (r && r->connFd != -1 && text) {
+            {"sendClipboardEvent", "([B)V", (void *) +[](JNIEnv *env, __unused jobject thiz, jbyteArray text) {
+                if (conn_fd != -1 && text) {
                     jsize length = env->GetArrayLength(text);
-                    jbyte* str = env->GetByteArrayElements(text, nullptr);
-                    sendEvent(r, .clipboardSend = { .t = EVENT_CLIPBOARD_SEND, .count = (uint32_t) length });
-                    write(r->connFd, str, length);
+                    jbyte* str = env->GetByteArrayElements(text, NULL);
+                    sendEvent(.clipboardSend = { .t = EVENT_CLIPBOARD_SEND, .count = (uint32_t) length });
+                    write(conn_fd, str, length);
                     env->ReleaseByteArrayElements(text, str, JNI_ABORT);
                 }
             }},
-            {"sendWindowChange", "(JIIILjava/lang/String;)V", (void *) +[](__unused JNIEnv* env, __unused jobject cls, jlong ptr, jint width, jint height, jint framerate, jstring jname) {
-                auto* r = (LorieViewResources*) ptr;
-                if (r && r->connFd != -1) {
-                    const char *name = (!jname || width <= 0 || height <= 0) ? nullptr : env->GetStringUTFChars(jname, JNI_FALSE);
-                    sendEvent(r, .screenSize = { .t = EVENT_SCREEN_SIZE, .width = (uint16_t) width, .height = (uint16_t) height, .framerate = (uint16_t) framerate, .name_size = (name ? strlen(name) : 0) });
+            {"sendWindowChange", "(IIILjava/lang/String;)V", (void *) +[](__unused JNIEnv* env, __unused jobject cls, jint width, jint height, jint framerate, jstring jname) {
+                if (conn_fd != -1) {
+                    const char *name = (!jname || width <= 0 || height <= 0) ? NULL : env->GetStringUTFChars(jname, JNI_FALSE);
+                    sendEvent(.screenSize = { .t = EVENT_SCREEN_SIZE, .width = (uint16_t) width, .height = (uint16_t) height, .framerate = (uint16_t) framerate, .name_size = (name ? strlen(name) : 0) });
                     if (name) {
-                        write(r->connFd, name, strlen(name));
+                        write(conn_fd, name, strlen(name));
                         env->ReleaseStringUTFChars(jname, name);
                     }
                 }
             }},
-            {"sendMouseEvent", "(JFFIZZ)V", (void *) +[](JNIEnv* env, __unused jobject cls, jlong ptr, jfloat x, jfloat y, jint which_button, jboolean button_down, jboolean relative) {
-                lastInputTimestampMs = nowMs();
-                auto* r = (LorieViewResources*) ptr;
-                if (r && r->connFd != -1) {
+            {"sendMouseEvent", "(FFIZZ)V", (void *) +[](__unused JNIEnv* env, __unused jobject cls, jfloat x, jfloat y, jint which_button, jboolean button_down, jboolean relative) {
+                if (conn_fd != -1) {
                     if (which_button > 0)
-                        env->CallVoidMethod(r->thiz, MainActivity.resetIme);
-                    sendEvent(r, .mouse = { .t = EVENT_MOUSE, .x = x, .y = y, .detail = (uint8_t) which_button, .down = button_down, .relative = relative });
+                        env->CallVoidMethod(globalThiz, MainActivity.resetIme);
+                    sendEvent(.mouse = { .t = EVENT_MOUSE, .x = x, .y = y, .detail = (uint8_t) which_button, .down = button_down, .relative = relative });
                 }
             }},
-            {"sendTouchEvent", "(JIIII)V", (void *) +[](__unused JNIEnv* env, __unused jobject cls, jlong ptr, jint action, jint id, jint x, jint y) {
-                lastInputTimestampMs = nowMs();
-                auto* r = (LorieViewResources*) ptr;
+            {"sendTouchEvent", "(IIII)V", (void *) +[](__unused JNIEnv* env, __unused jobject cls, jint action, jint id, jint x, jint y) {
                 if (action != -1)
-                    sendEvent(r, .touch = { .t = EVENT_TOUCH, .type = (uint16_t) action, .id = (uint16_t) id, .x = (uint16_t) x, .y = (uint16_t) y });
+                    sendEvent(.touch = { .t = EVENT_TOUCH, .type = (uint16_t) action, .id = (uint16_t) id, .x = (uint16_t) x, .y = (uint16_t) y });
             }},
-            {"sendStylusEvent", "(JFFIIIIIZZ)V", (void *) +[](JNIEnv *env, __unused jobject thiz, jlong ptr, jfloat x, jfloat y, jint pressure, jint tilt_x, jint tilt_y, jint orientation, jint buttons, jboolean eraser, jboolean mouse) {
-                lastInputTimestampMs = nowMs();
-                auto* r = (LorieViewResources*) ptr;
-                if (r && r->connFd != -1) {
-                    env->CallVoidMethod(r->thiz, MainActivity.resetIme);
-                    sendEvent(r, .stylus = { .t = EVENT_STYLUS, .x = x, .y = y, .pressure = (uint16_t) pressure, .tilt_x = (int8_t) tilt_x, .tilt_y = (int8_t) tilt_y, .orientation = (int16_t) orientation, .buttons = (uint8_t) buttons, .eraser = eraser, .mouse = mouse });
+            {"sendStylusEvent", "(FFIIIIIZZ)V", (void *) +[](__unused JNIEnv *env, __unused jobject thiz, jfloat x, jfloat y, jint pressure, jint tilt_x, jint tilt_y, jint orientation, jint buttons, jboolean eraser, jboolean mouse) {
+                if (conn_fd != -1) {
+                    env->CallVoidMethod(globalThiz, MainActivity.resetIme);
+                    sendEvent(.stylus = { .t = EVENT_STYLUS, .x = x, .y = y, .pressure = (uint16_t) pressure, .tilt_x = (int8_t) tilt_x, .tilt_y = (int8_t) tilt_y, .orientation = (int16_t) orientation, .buttons = (uint8_t) buttons, .eraser = eraser, .mouse = mouse });
                 }
             }},
-            {"requestStylusEnabled", "(JZ)V", (void *) +[](__unused JNIEnv *env, __unused jobject thiz, jlong ptr, jboolean enabled) {
-                auto* r = (LorieViewResources*) ptr;
-                sendEvent(r, .stylusEnable = { .t = EVENT_STYLUS_ENABLE, .enable = enabled });
+            {"requestStylusEnabled", "(Z)V", (void *) +[](__unused JNIEnv *env, __unused jclass clazz, jboolean enabled) {
+                sendEvent(.stylusEnable = { .t = EVENT_STYLUS_ENABLE, .enable = enabled });
             }},
-            {"sendLockKeysState", "(JI)V", (void *) +[](__unused JNIEnv *env, __unused jobject thiz, jlong ptr, jint state) {
-                auto* r = (LorieViewResources*) ptr;
-                sendEvent(r, .lockKeysState = { .t = EVENT_LOCK_KEYS_STATE, .state = (uint8_t) state });
-            }},
-            {"sendKeyEvent", "(JIIZ)Z", (void *) +[](__unused JNIEnv* env, __unused jobject cls, jlong ptr, jint scan_code, jint key_code, jboolean key_down) -> jboolean {
-                lastInputTimestampMs = nowMs();
-                auto* r = (LorieViewResources*) ptr;
-                if (r && r->connFd != -1) {
-                    int code = scan_code ?: (key_code >= 0 && key_code < (jint) (sizeof(android_to_linux_keycode) / sizeof(*android_to_linux_keycode)) ? android_to_linux_keycode[key_code] : 0);
-                    sendEvent(r, .key = { .t = EVENT_KEY, .key = (uint16_t) (code + 8), .state = key_down });
+            {"sendKeyEvent", "(IIZ)Z", (void *) +[](__unused JNIEnv* env, __unused jobject cls, jint scan_code, jint key_code, jboolean key_down) -> jboolean {
+                if (conn_fd != -1) {
+                    int code = (scan_code) ?: android_to_linux_keycode[key_code];
+                    sendEvent(.key = { .t = EVENT_KEY, .key = (uint16_t) (code + 8), .state = key_down });
                 }
                 return true;
             }},
-            {"sendTextEvent", "(J[B)V", (void *)&sendTextEvent},
-            {"requestConnection", "(J)Z", (void *)&requestConnection},
-            // @CriticalNative without parameters: do not add any or they will break on Android < 8.
-            {"getLastInputTimestamp", "()J", (void *) +[](__unused JNIEnv* env, __unused jclass clazz) -> jlong {
-                return (jlong) lastInputTimestampMs;
-            }},
-            {"markUserActivity", "()V", (void *) +[](__unused JNIEnv* env, __unused jclass clazz) {
-                lastInputTimestampMs = nowMs();
-            }},
+            {"sendTextEvent", "([B)V", (void *)&sendTextEvent},
+            {"requestConnection", "()Z", (void *)&requestConnection},
     };
-    vm->AttachCurrentThread(&env, nullptr);
+    vm->AttachCurrentThread(&env, NULL);
     jclass cls = env->FindClass("com/termux/x11/LorieView");
-
-    // Checks whether this runtime honors @CriticalNative at all: it does if probe() receives its argument first.
-    constexpr jlong probeValue = 0x7e57;
-    jclass probeCls = env->FindClass("com/termux/x11/LorieView$CriticalNativeProbe");
-    JNINativeMethod probe = {"probe", "(J)Z", (void *) +[](jlong value) -> jboolean { return value == probeValue; }};
-    env->RegisterNatives(probeCls, &probe, 1);
-    bool criticalNativeSupported = env->CallStaticBooleanMethod(probeCls, env->GetStaticMethodID(probeCls, "probe", "(J)Z"), probeValue);
-    env->ExceptionClear();
-
     env->RegisterNatives(cls, methods, sizeof(methods)/sizeof(methods[0]));
 
-    // Runtimes ignoring @CriticalNative pass JNIEnv* and jclass to such natives too, so they get regular JNI adapters.
-    // Indices of the @CriticalNative methods taking parameters in methods[]: update them along with the adapters here.
-    static_assert(!__builtin_strcmp(methods[12].name, "connected") && !__builtin_strcmp(methods[12].signature, "(J)Z") &&
-                  !__builtin_strcmp(methods[25].name, "requestConnection") && !__builtin_strcmp(methods[25].signature, "(J)Z"));
-    if (!criticalNativeSupported) {
-        JNINativeMethod adapters[] = {
-                {methods[12].name, methods[12].signature, (void *) +[](__unused JNIEnv* env, __unused jclass clazz, jlong ptr) -> jboolean {
-                    return ((jboolean (*)(jlong)) methods[12].fnPtr)(ptr);
-                }},
-                {methods[25].name, methods[25].signature, (void *) +[](__unused JNIEnv* env, __unused jclass clazz, jlong ptr) -> jboolean {
-                    return ((jboolean (*)(jlong)) methods[25].fnPtr)(ptr);
-                }},
-        };
-        env->RegisterNatives(cls, adapters, sizeof(adapters)/sizeof(adapters[0]));
+    return JNI_VERSION_1_6;
+}
+
+
+// It is needed to redirect stderr to logcat
+static void* stderrToLogcatThread(__unused void* cookie) {
+    FILE *fp;
+    int p[2];
+    size_t len;
+    char *line = NULL;
+    pipe(p);
+
+    fp = fdopen(p[0], "r");
+
+    dup2(p[1], 2);
+    dup2(p[1], 1);
+    while ((getline(&line, &len, fp)) != -1) {
+        log(DEBUG, "%s%s", line, (line[len - 1] == '\n') ? "" : "\n");
     }
 
-    pthread_t freeformLookupThread;
-    pthread_create(&freeformLookupThread, nullptr, +[](void* arg) -> void* {
-        auto* vm = (JavaVM*) arg;
-        JNIEnv* threadEnv;
-        vm->AttachCurrentThread(&threadEnv, nullptr);
-        jclass activityOptionsClass = threadEnv->FindClass("android/app/ActivityOptions");
-        jmethodID method = activityOptionsClass ? threadEnv->GetMethodID(activityOptionsClass, "setLaunchWindowingMode", "(I)V") : nullptr;
-        threadEnv->ExceptionClear();
-        vm->DetachCurrentThread();
-        return (void*) method;
-    }, vm);
-    void* freeformMethod;
-    pthread_join(freeformLookupThread, &freeformMethod);
-    ActivityOptions.setLaunchWindowingMode = (jmethodID) freeformMethod;
-    if (!ActivityOptions.setLaunchWindowingMode)
-        log(ERROR, "ActivityOptions.setLaunchWindowingMode(int) not found");
+    return NULL;
+}
 
-    static JNINativeMethod mainActivityMethods[] = {
-            {"nativeSetLaunchWindowingModeFreeform", "(Ljava/lang/Object;)V", (void *) +[](JNIEnv *env, __unused jclass clazz, jobject options) {
-                if (ActivityOptions.setLaunchWindowingMode)
-                    env->CallVoidMethod(options, ActivityOptions.setLaunchWindowingMode, 5); // WINDOWING_MODE_FREEFORM
-            }},
-    };
-    env->RegisterNatives(env->FindClass("com/termux/x11/MainActivity"), mainActivityMethods, sizeof(mainActivityMethods)/sizeof(mainActivityMethods[0]));
-
-    registerCmdEntryPointNatives(env);
-
-    return JNI_VERSION_1_6;
+extern char* __progname;
+__attribute__((constructor)) static void init(void) {
+    pthread_t t;
+    if (!strcmp(__progname, "com.termux.x11"))
+        pthread_create(&t, NULL, stderrToLogcatThread, NULL);
 }
