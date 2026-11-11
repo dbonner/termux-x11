@@ -36,6 +36,7 @@ public final class InputEventSender {
         KEYCODE_APP_SWITCH
     );
 
+    private final MainActivity mActivity;
     private final InputStub mInjector;
     private final float[] mappedPoint = new float[2];
 
@@ -53,9 +54,13 @@ public final class InputEventSender {
     private final TreeSet<Integer> mPressedTextKeys;
     private final TreeSet<Integer> mPressedKeys;
 
-    public InputEventSender(InputStub injector) {
+    /** Last Caps/Num/Scroll Lock state sent to the host, or -1 if none has been sent yet. */
+    private int mLockKeysState = -1;
+
+    public InputEventSender(MainActivity activity, InputStub injector) {
         if (injector == null)
             throw new NullPointerException();
+        mActivity = activity;
         mInjector = injector;
         mPressedTextKeys = new TreeSet<>();
         mPressedKeys = new TreeSet<>();
@@ -86,6 +91,23 @@ public final class InputEventSender {
                         mInjector.sendKeyEvent(0, mod[i], false);
                 }
             }
+        }
+    }
+
+    /**
+     * Mirrors Android's current Caps/Num/Scroll Lock state onto the host, e.g. after regaining
+     * focus with the state possibly having changed while backgrounded. Every KeyEvent and
+     * MotionEvent carries the current state in its metaState regardless of which key or pointer
+     * action it represents, so callers can just forward it on every real (non-synthetic) event;
+     * this only actually notifies the host when the state actually changed.
+     */
+    public void syncLockKeysState(int eventMetaState) {
+        int state = (((eventMetaState & META_CAPS_LOCK_ON) != 0) ? 1 : 0)
+                | (((eventMetaState & META_NUM_LOCK_ON) != 0) ? 2 : 0)
+                | (((eventMetaState & META_SCROLL_LOCK_ON) != 0) ? 4 : 0);
+        if (state != mLockKeysState) {
+            mLockKeysState = state;
+            mInjector.sendLockKeysState(state);
         }
     }
 
@@ -127,7 +149,17 @@ public final class InputEventSender {
         mInjector.sendMouseWheelEvent(distanceX, distanceY);
     }
 
-    final boolean[] pointers = new boolean[10];
+    private final boolean[] pointers = new boolean[32];
+
+    private void releaseMissingPointers(MotionEvent event) {
+        for (int id = 0; id < pointers.length; id++) {
+            if (pointers[id] && (event == null || event.findPointerIndex(id) == -1)) {
+                pointers[id] = false;
+                mInjector.sendTouchEvent(XI_TouchEnd, id, 0, 0);
+            }
+        }
+    }
+
     /**
      * Extracts the touch point data from a MotionEvent, converts each point into a marshallable
      * object and passes the set of points to the JNI layer to be transmitted to the remote host.
@@ -138,28 +170,24 @@ public final class InputEventSender {
      */
     public void sendTouchEvent(MotionEvent event, RenderData renderData) {
         int action = event.getActionMasked();
+        releaseMissingPointers(action == MotionEvent.ACTION_DOWN || action == ACTION_CANCEL ? null : event);
+        if (action == ACTION_CANCEL)
+            return;
 
         if (action == ACTION_MOVE || action == ACTION_HOVER_MOVE || action == ACTION_HOVER_ENTER || action == ACTION_HOVER_EXIT) {
-            // In order to process all of the events associated with an ACTION_MOVE event, we need
-            // to walk the list of historical events in order and add each event to our list, then
-            // retrieve the current move event data.
             int pointerCount = event.getPointerCount();
 
-            for (int p = 0; p < pointerCount; p++)
-                pointers[event.getPointerId(p)] = false;
-
-            for (int p = 0; p < pointerCount; p++) {
-                renderData.mapScreenPoint(event.getX(p), event.getY(p), mappedPoint);
-                int x = clamp((int) mappedPoint[0], 0, renderData.screenWidth);
-                int y = clamp((int) mappedPoint[1], 0, renderData.screenHeight);
-                pointers[event.getPointerId(p)] = true;
-                mInjector.sendTouchEvent(XI_TouchUpdate, event.getPointerId(p), x, y);
-            }
-
-            // Sometimes Android does not send ACTION_POINTER_UP/ACTION_UP so some pointers are "stuck" in pressed state.
-            for (int p = 0; p < 10; p++) {
-                if (!pointers[p])
-                    mInjector.sendTouchEvent(XI_TouchEnd, p, 0, 0);
+            int historySize = event.getHistorySize();
+            for (int h = 0; h <= historySize; h++) {
+                for (int p = 0; p < pointerCount; p++) {
+                    float eventX = h < historySize ? event.getHistoricalX(p, h) : event.getX(p);
+                    float eventY = h < historySize ? event.getHistoricalY(p, h) : event.getY(p);
+                    renderData.mapScreenPoint(eventX, eventY, mappedPoint);
+                    int x = clamp((int) mappedPoint[0], 0, renderData.screenWidth);
+                    int y = clamp((int) mappedPoint[1], 0, renderData.screenHeight);
+                    pointers[event.getPointerId(p)] = true;
+                    mInjector.sendTouchEvent(XI_TouchUpdate, event.getPointerId(p), x, y);
+                }
             }
         } else {
             // For all other events, we only want to grab the current/active pointer.  The event
@@ -173,6 +201,7 @@ public final class InputEventSender {
             int a = (action == MotionEvent.ACTION_DOWN || action == ACTION_POINTER_DOWN) ? XI_TouchBegin : XI_TouchEnd;
             if (a == XI_TouchEnd)
                 mInjector.sendTouchEvent(XI_TouchUpdate, id, x, y);
+            pointers[id] = a == XI_TouchBegin;
             mInjector.sendTouchEvent(a, id, x, y);
         }
     }
@@ -185,6 +214,9 @@ public final class InputEventSender {
     public boolean sendKeyEvent(KeyEvent e) {
         int keyCode = e.getKeyCode();
         boolean pressed = e.getAction() == KeyEvent.ACTION_DOWN;
+
+        if (e.getDeviceId() >= 0)
+            syncLockKeysState(e.getMetaState());
 
         if ((e.getFlags() & KeyEvent.FLAG_CANCELED) == KeyEvent.FLAG_CANCELED) {
             android.util.Log.d("KeyEvent", "We've got key event with FLAG_CANCELED, it will not be consumed. Details: " + e);
@@ -270,7 +302,7 @@ public final class InputEventSender {
             mPressedKeys.remove(keyCode);
 
         if (keyCode == KEYCODE_ESCAPE && !pressed && e.hasNoModifiers())
-            MainActivity.setCapturingEnabled(false);
+            mActivity.setCapturingEnabled(false);
 
         // We try to send all other key codes to the host directly.
         return mInjector.sendKeyEvent(scancode, keyCode, pressed);
